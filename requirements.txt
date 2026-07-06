@@ -1,0 +1,2 @@
+# No extra third-party dependencies.
+# SQLAlchemy is already used by AstrBot.

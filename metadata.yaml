@@ -1,0 +1,12 @@
+name: astrbot_plugin_lifetime_tokens
+desc: Unified lifetime token report from AstrBot provider_stats, with merged text and T2I image output.
+help: |
+  Commands:
+  /lifetime_report - unified text report
+  /lifetime_report_img - unified image report
+
+  Optional config:
+  provider_limit - how many top providers to show (default 10, max 50)
+version: v0.6.3
+author: TommyLamm
+repo: ""
