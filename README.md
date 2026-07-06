@@ -4,6 +4,10 @@ A small AstrBot plugin that reads the existing `provider_stats` table and report
 
 This version uses a unified design with only two commands.
 
+## Preview
+
+![Preview](assets/preview.png)
+
 ## Commands
 
 ```text
