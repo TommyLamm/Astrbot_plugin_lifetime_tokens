@@ -9,4 +9,4 @@ help: |
   provider_limit - how many top providers to show (default 10, max 50)
 version: v0.6.3
 author: TommyLamm
-repo: ""
+repo: https://github.com/TommyLamm/Astrbot_plugin_lifetime_tokens
