@@ -271,7 +271,6 @@ class LifetimeTokenStatsPlugin(Star):
         last_dt = self._parse_datetime(summary.get("last_record_at"))
         active_days = max((last_dt - first_dt).days, 1) if (first_dt and last_dt) else None
         avg_tokens_per_day = (total / active_days) if active_days else None
-        avg_calls_per_day = (calls / active_days) if active_days else None
 
         if calls == 0:
             body = """
@@ -287,7 +286,6 @@ class LifetimeTokenStatsPlugin(Star):
                 generated_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
             )
 
-        input_pct = (input_tokens / total * 100) if total else 0
         output_pct = (output_tokens / total * 100) if total else 0
         input_other_pct = (input_other / total * 100) if total else 0
         input_cached_pct = (input_cached / total * 100) if total else 0
@@ -425,8 +423,6 @@ class LifetimeTokenStatsPlugin(Star):
                 """
             )
 
-        providers_caption = f"Top {self.provider_limit} shown" if provider_count > len(rows) else ""
-
         body = f"""
           <div class="grid">
             <div class="metric hero">
@@ -438,13 +434,12 @@ class LifetimeTokenStatsPlugin(Star):
               <div class="value">{self._fmt(calls)}</div>
             </div>
             <div class="metric">
-              <div class="label">CACHE HIT RATE</div>
-              <div class="value">{cached_pct_of_input:.2f}%</div>
+              <div class="label">INPUT TOKENS</div>
+              <div class="value">{self._fmt(input_tokens)}</div>
             </div>
             <div class="metric">
-              <div class="label">PROVIDERS</div>
-              <div class="value">{self._fmt(provider_count)}</div>
-              {f'<div class="caption">{escape(providers_caption)}</div>' if providers_caption else ''}
+              <div class="label">OUTPUT TOKENS</div>
+              <div class="value">{self._fmt(output_tokens)}</div>
             </div>
           </div>
 
@@ -458,14 +453,6 @@ class LifetimeTokenStatsPlugin(Star):
                 </div>
               </div>
               <div class="pie-side">
-                <div class="stack">
-                  <div class="stack-input" style="width: {input_pct:.2f}%"></div>
-                  <div class="stack-output" style="width: {output_pct:.2f}%"></div>
-                </div>
-                <div class="legend">
-                  <span><i class="dot input"></i>Input {input_pct:.2f}%</span>
-                  <span><i class="dot output"></i>Output {output_pct:.2f}%</span>
-                </div>
                 <div class="breakdown-list">
                   {''.join(token_rows_html)}
                 </div>
@@ -474,8 +461,8 @@ class LifetimeTokenStatsPlugin(Star):
           </div>
 
           <div class="details">
+            <div><span>Providers</span><b>{self._fmt(provider_count)} · Top {self.provider_limit} shown</b></div>
             <div><span>Avg Tokens / Call</span><b>{avg_total:,.2f}</b></div>
-            <div><span>Avg Calls / Day</span><b>{f"{avg_calls_per_day:,.1f}" if avg_calls_per_day is not None else "N/A"}</b></div>
             <div><span>Active Period</span><b>{f"{active_days:,} days" if active_days is not None else "N/A"}</b></div>
             <div><span>Avg Tokens / Day</span><b>{f"{avg_tokens_per_day:,.0f}" if avg_tokens_per_day is not None else "N/A"}</b></div>
           </div>
@@ -490,8 +477,8 @@ class LifetimeTokenStatsPlugin(Star):
             <div class="provider-pie-strip">
               <div class="provider-pie-chart" style="background: {provider_pie_bg};">
                 <div class="provider-pie-hole">
-                  <div class="pie-total-label">Shown</div>
-                  <div class="pie-total-value">{len(rows)}</div>
+                  <div class="pie-total-label">Total</div>
+                  <div class="pie-total-value">{self._fmt(total)}</div>
                 </div>
               </div>
               <div class="pie-legend compact">
@@ -544,7 +531,6 @@ class LifetimeTokenStatsPlugin(Star):
   .metric .label {{ font-size: 13px; color: #64748b; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }}
   .metric .value {{ margin-top: 8px; font-size: 24px; font-weight: 800; letter-spacing: -0.035em; }}
   .metric.hero .value {{ color: #1d4ed8; font-size: 27px; }}
-  .metric .caption {{ margin-top: 4px; font-size: 12px; color: #94a3b8; font-weight: 700; }}
   .section {{ margin-top: 14px; padding: 16px; border-radius: 18px; background: #f8fafc; border: 1px solid #e2e8f0; }}
   .section-title {{ font-size: 17px; font-weight: 800; margin-bottom: 10px; }}
   .section-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 14px; }}
@@ -562,13 +548,6 @@ class LifetimeTokenStatsPlugin(Star):
   .pie-legend-item span {{ flex: 1; color: #334155; font-weight: 700; overflow-wrap: anywhere; }}
   .pie-legend-item b {{ white-space: nowrap; }}
   .pie-dot {{ width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }}
-  .stack {{ display: flex; overflow: hidden; height: 24px; border-radius: 999px; background: #e2e8f0; }}
-  .stack-input {{ background: linear-gradient(90deg, #2563eb, #60a5fa); }}
-  .stack-output {{ background: linear-gradient(90deg, #10b981, #34d399); }}
-  .legend {{ display: flex; gap: 14px; margin-top: 2px; font-size: 13px; color: #475569; font-weight: 700; flex-wrap: wrap; }}
-  .dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 7px; }}
-  .dot.input {{ background: #2563eb; }}
-  .dot.output {{ background: #10b981; }}
   .details {{ margin-top: 14px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }}
   .details div {{ display: flex; justify-content: space-between; gap: 12px; padding: 12px 14px; border-radius: 12px; background: #f8fafc; border: 1px solid #e2e8f0; font-size: 14px; }}
   .details span {{ color: #64748b; font-weight: 700; }}
@@ -577,6 +556,8 @@ class LifetimeTokenStatsPlugin(Star):
   .provider-pie-strip {{ display: flex; align-items: center; gap: 16px; margin-bottom: 12px; padding: 14px; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; flex-wrap: wrap; }}
   .provider-pie-chart {{ width: 130px; height: 130px; border-radius: 50%; position: relative; flex-shrink: 0; }}
   .provider-pie-hole {{ position: absolute; inset: 16px; background: #ffffff; border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; box-shadow: inset 0 0 0 1px #e2e8f0; }}
+  .provider-pie-hole .pie-total-label {{ font-size: 11px; }}
+  .provider-pie-hole .pie-total-value {{ margin-top: 3px; font-size: 15px; }}
   .provider-row {{ border: 1px solid #e2e8f0; border-radius: 16px; padding: 14px; background: #fbfdff; }}
   .provider-head {{ display: flex; align-items: center; justify-content: space-between; gap: 18px; }}
   .provider-name {{ display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 16px; font-weight: 800; overflow-wrap: anywhere; }}
