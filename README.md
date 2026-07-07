@@ -147,3 +147,15 @@ Then reload plugins in AstrBot WebUI.
   between reports (e.g. due to normal usage fluctuation), their colors
   would swap too. Now a given provider keeps the same color across reports
   as long as it stays within the shown set, independent of its rank.
+
+## v0.6.4
+
+- Replaced the "Input Tokens" / "Output Tokens" hero metric cards, which
+  duplicated the "Token Composition" section directly below them, with:
+  - **Cache Hit Rate** (`input_cached_tokens / input_tokens`) — computed
+    before but never actually shown in the image report.
+  - **Providers** (distinct provider count), promoted from a line of text
+    inside the Details grid to its own hero card. Shows a small "Top N
+    shown" caption underneath only when the count is actually truncated.
+- Details grid: since "Providers" moved up to the hero row, added
+  "Avg Calls / Day" in its place to keep the 2x2 grid balanced.

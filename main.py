@@ -271,6 +271,7 @@ class LifetimeTokenStatsPlugin(Star):
         last_dt = self._parse_datetime(summary.get("last_record_at"))
         active_days = max((last_dt - first_dt).days, 1) if (first_dt and last_dt) else None
         avg_tokens_per_day = (total / active_days) if active_days else None
+        avg_calls_per_day = (calls / active_days) if active_days else None
 
         if calls == 0:
             body = """
@@ -424,6 +425,8 @@ class LifetimeTokenStatsPlugin(Star):
                 """
             )
 
+        providers_caption = f"Top {self.provider_limit} shown" if provider_count > len(rows) else ""
+
         body = f"""
           <div class="grid">
             <div class="metric hero">
@@ -435,12 +438,13 @@ class LifetimeTokenStatsPlugin(Star):
               <div class="value">{self._fmt(calls)}</div>
             </div>
             <div class="metric">
-              <div class="label">INPUT TOKENS</div>
-              <div class="value">{self._fmt(input_tokens)}</div>
+              <div class="label">CACHE HIT RATE</div>
+              <div class="value">{cached_pct_of_input:.2f}%</div>
             </div>
             <div class="metric">
-              <div class="label">OUTPUT TOKENS</div>
-              <div class="value">{self._fmt(output_tokens)}</div>
+              <div class="label">PROVIDERS</div>
+              <div class="value">{self._fmt(provider_count)}</div>
+              {f'<div class="caption">{escape(providers_caption)}</div>' if providers_caption else ''}
             </div>
           </div>
 
@@ -470,8 +474,8 @@ class LifetimeTokenStatsPlugin(Star):
           </div>
 
           <div class="details">
-            <div><span>Providers</span><b>{self._fmt(provider_count)} · Top {self.provider_limit} shown</b></div>
             <div><span>Avg Tokens / Call</span><b>{avg_total:,.2f}</b></div>
+            <div><span>Avg Calls / Day</span><b>{f"{avg_calls_per_day:,.1f}" if avg_calls_per_day is not None else "N/A"}</b></div>
             <div><span>Active Period</span><b>{f"{active_days:,} days" if active_days is not None else "N/A"}</b></div>
             <div><span>Avg Tokens / Day</span><b>{f"{avg_tokens_per_day:,.0f}" if avg_tokens_per_day is not None else "N/A"}</b></div>
           </div>
@@ -540,6 +544,7 @@ class LifetimeTokenStatsPlugin(Star):
   .metric .label {{ font-size: 13px; color: #64748b; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }}
   .metric .value {{ margin-top: 8px; font-size: 24px; font-weight: 800; letter-spacing: -0.035em; }}
   .metric.hero .value {{ color: #1d4ed8; font-size: 27px; }}
+  .metric .caption {{ margin-top: 4px; font-size: 12px; color: #94a3b8; font-weight: 700; }}
   .section {{ margin-top: 14px; padding: 16px; border-radius: 18px; background: #f8fafc; border: 1px solid #e2e8f0; }}
   .section-title {{ font-size: 17px; font-weight: 800; margin-bottom: 10px; }}
   .section-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 14px; }}
