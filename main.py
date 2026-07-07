@@ -16,8 +16,8 @@ class LifetimeTokenStatsPlugin(Star):
     """Read AstrBot provider_stats and report lifetime token usage.
 
     Commands:
-      /lifetime_report
-      /lifetime_report_img
+      /token_text
+      /token
 
     Optional plugin config:
       provider_limit: how many top providers to display (default 10)

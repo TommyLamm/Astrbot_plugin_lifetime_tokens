@@ -11,8 +11,8 @@ This version uses a unified design with only two commands.
 ## Commands
 
 ```text
-/lifetime_report
-/lifetime_report_img
+/token_text
+/token
 ```
 
 ## Optional config
