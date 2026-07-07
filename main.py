@@ -42,7 +42,7 @@ class LifetimeTokenStatsPlugin(Star):
             self.provider_limit,
         )
 
-    @filter.command("lifetime_report")
+    @filter.command("token_text")
     async def lifetime_report(self, event: AstrMessageEvent):
         """Show a unified lifetime token report in text."""
         try:
@@ -56,7 +56,7 @@ class LifetimeTokenStatsPlugin(Star):
                 f"錯誤：{type(exc).__name__}: {exc}"
             )
 
-    @filter.command("lifetime_report_img")
+    @filter.command("token")
     async def lifetime_report_img(self, event: AstrMessageEvent):
         """Render a unified lifetime token report as a T2I image."""
         try:
