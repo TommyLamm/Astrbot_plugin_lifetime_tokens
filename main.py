@@ -28,8 +28,6 @@ class LifetimeTokenStatsPlugin(Star):
     MAX_PROVIDER_LIMIT = 50
     VIEWPORT_WIDTH = 1200
     VIEWPORT_HEIGHT = 680
-    # "Others" 分類固定使用中性灰色，不與供應商配色混淆 / fixed neutral for the "Others" bucket
-    OTHERS_COLOR = "#94a3b8"
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context, config)
@@ -46,22 +44,20 @@ class LifetimeTokenStatsPlugin(Star):
     async def lifetime_report(self, event: AstrMessageEvent):
         """Show a unified lifetime token report in text."""
         try:
-            summary = await self._query_lifetime_summary()
-            rows = await self._query_provider_lifetime()
+            summary, rows = await self._fetch_report_data()
             yield event.plain_result(self._format_unified_report(summary, rows))
         except Exception as exc:
             logger.exception("Failed to query unified lifetime token report.")
             yield event.plain_result(
-                "查詢 unified lifetime token report 失敗。\n"
-                f"錯誤：{type(exc).__name__}: {exc}"
+                "查詢 unified lifetime token report 失敗，詳細錯誤已記錄到日誌。\n"
+                f"錯誤類型：{type(exc).__name__}"
             )
 
     @filter.command("token")
     async def lifetime_report_img(self, event: AstrMessageEvent):
         """Render a unified lifetime token report as a T2I image."""
         try:
-            summary = await self._query_lifetime_summary()
-            rows = await self._query_provider_lifetime()
+            summary, rows = await self._fetch_report_data()
             html = self._build_unified_report_html(summary, rows)
             fallback_text = self._format_unified_report(summary, rows)
             image = await self._render_stats_image(html, fallback_text)
@@ -69,44 +65,39 @@ class LifetimeTokenStatsPlugin(Star):
         except Exception as exc:
             logger.exception("Failed to render unified lifetime token report image.")
             yield event.plain_result(
-                "生成 unified lifetime token report 圖片失敗。\n"
-                f"錯誤：{type(exc).__name__}: {exc}"
+                "生成 unified lifetime token report 圖片失敗，詳細錯誤已記錄到日誌。\n"
+                f"錯誤類型：{type(exc).__name__}"
             )
 
     async def terminate(self) -> None:
         logger.info("Lifetime Token Stats plugin unloaded.")
 
-    async def _query_lifetime_summary(self) -> dict[str, Any]:
-        db = getattr(self.context, "_db", None)
-        if db is None or not hasattr(db, "get_db"):
-            raise RuntimeError("Cannot access AstrBot database from plugin context.")
+    async def _fetch_report_data(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Fetch everything both report renderers need with a single query.
 
-        sql = text(
-            """
-            SELECT
-                COUNT(*) AS lifetime_calls,
-                COALESCE(SUM(token_input_other), 0) AS input_other_tokens,
-                COALESCE(SUM(token_input_cached), 0) AS input_cached_tokens,
-                COALESCE(SUM(token_input_other + token_input_cached), 0) AS input_tokens,
-                COALESCE(SUM(token_output), 0) AS output_tokens,
-                COALESCE(SUM(token_input_other + token_input_cached + token_output), 0)
-                    AS total_tokens,
-                MIN(created_at) AS first_record_at,
-                MAX(created_at) AS last_record_at,
-                COUNT(DISTINCT COALESCE(provider_id, '<unknown>') || '|' || COALESCE(provider_model, '<unknown>'))
-                    AS provider_count
-            FROM provider_stats
-            WHERE agent_type = :agent_type
-            """
-        )
+        優化重點 / Optimization: 舊版分別呼叫 `_query_lifetime_summary`（全表
+        COUNT/SUM）與 `_query_provider_lifetime`（全表 GROUP BY + LIMIT），
+        兩者都各自對 `provider_stats` 做一次完整掃描，且是序列 await。
+        Provider 的種類數通常遠小於原始記錄數，所以改成只用一次不加
+        LIMIT 的 GROUP BY 查詢撈出「所有」provider 分組，lifetime summary
+        再用 Python 對這份結果做 sum/min/max 彙總即可，不需要第二次掃表。
 
-        async with db.get_db() as session:
-            result = await session.execute(sql, {"agent_type": self.AGENT_TYPE})
-            row = result.mappings().first()
+        Returns (summary, rows) where `rows` is already truncated to
+        `self.provider_limit` for display, while `summary` reflects the
+        totals across *all* providers (not just the shown ones).
+        """
+        all_rows = await self._query_all_provider_stats()
+        summary = self._summarize_provider_rows(all_rows)
+        rows = all_rows[: self.provider_limit]
+        return summary, rows
 
-        return dict(row or {})
+    async def _query_all_provider_stats(self) -> list[dict[str, Any]]:
+        """Group by provider identity across the whole table, no LIMIT.
 
-    async def _query_provider_lifetime(self) -> list[dict[str, Any]]:
+        This is now the *only* query the plugin runs per report. It used
+        to be paired with a separate whole-table aggregate query; see
+        `_fetch_report_data` for why that was removed.
+        """
         db = getattr(self.context, "_db", None)
         if db is None or not hasattr(db, "get_db"):
             raise RuntimeError("Cannot access AstrBot database from plugin context.")
@@ -129,21 +120,61 @@ class LifetimeTokenStatsPlugin(Star):
             WHERE agent_type = :agent_type
             GROUP BY provider_id, provider_model
             ORDER BY total_tokens DESC
-            LIMIT :limit
             """
         )
 
         async with db.get_db() as session:
-            result = await session.execute(
-                sql,
-                {
-                    "agent_type": self.AGENT_TYPE,
-                    "limit": self.provider_limit,
-                },
-            )
+            result = await session.execute(sql, {"agent_type": self.AGENT_TYPE})
             rows = result.mappings().all()
 
         return [dict(row) for row in rows]
+
+    def _summarize_provider_rows(self, all_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Roll the full per-provider result set up into lifetime totals.
+
+        Equivalent to the old dedicated summary query's COUNT/SUM/MIN/MAX,
+        but computed in Python from data we already fetched, instead of
+        re-scanning `provider_stats` a second time.
+        """
+        if not all_rows:
+            return {
+                "lifetime_calls": 0,
+                "input_other_tokens": 0,
+                "input_cached_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "first_record_at": None,
+                "last_record_at": None,
+                "provider_count": 0,
+            }
+
+        # Parsed (not raw) datetimes are compared here, via the same
+        # `_parse_datetime` used for display, so mixed timestamp formats
+        # across rows still sort correctly (a plain string min/max would
+        # not be guaranteed to match chronological order).
+        first_dts = [
+            dt
+            for dt in (self._parse_datetime(row.get("first_record_at")) for row in all_rows)
+            if dt is not None
+        ]
+        last_dts = [
+            dt
+            for dt in (self._parse_datetime(row.get("last_record_at")) for row in all_rows)
+            if dt is not None
+        ]
+
+        return {
+            "lifetime_calls": sum(int(row.get("calls") or 0) for row in all_rows),
+            "input_other_tokens": sum(int(row.get("input_other_tokens") or 0) for row in all_rows),
+            "input_cached_tokens": sum(int(row.get("input_cached_tokens") or 0) for row in all_rows),
+            "input_tokens": sum(int(row.get("input_tokens") or 0) for row in all_rows),
+            "output_tokens": sum(int(row.get("output_tokens") or 0) for row in all_rows),
+            "total_tokens": sum(int(row.get("total_tokens") or 0) for row in all_rows),
+            "first_record_at": min(first_dts) if first_dts else None,
+            "last_record_at": max(last_dts) if last_dts else None,
+            "provider_count": len(all_rows),
+        }
 
     async def _render_stats_image(self, html: str, fallback_text: str) -> str:
         try:
@@ -170,11 +201,15 @@ class LifetimeTokenStatsPlugin(Star):
             )
             return await self.text_to_image(fallback_text, return_url=True)
 
-    def _format_unified_report(
-        self,
-        summary: dict[str, Any],
-        rows: list[dict[str, Any]],
-    ) -> str:
+    def _compute_summary_metrics(self, summary: dict[str, Any]) -> dict[str, Any]:
+        """Derive every percentage/average both report renderers need.
+
+        優化重點 / Optimization: `_format_unified_report`（文字報表）與
+        `_build_unified_report_html`（圖片報表）過去各自重算一份完全相同的
+        衍生數值（百分比、平均值⋯），兩份公式各自維護，容易在其中一邊修改
+        時忘記同步另一邊（v0.6.3 修的 Data Range 重複顯示問題即屬此類）。
+        統一抽到這裡之後，兩個 renderer 只需要從回傳的 dict 讀值。
+        """
         calls = int(summary.get("lifetime_calls") or 0)
         total = int(summary.get("total_tokens") or 0)
         input_tokens = int(summary.get("input_tokens") or 0)
@@ -182,14 +217,53 @@ class LifetimeTokenStatsPlugin(Star):
         input_cached = int(summary.get("input_cached_tokens") or 0)
         output_tokens = int(summary.get("output_tokens") or 0)
         provider_count = int(summary.get("provider_count") or 0)
-        avg_total = total / calls if calls else 0
-        first_record = self._safe_datetime(summary.get("first_record_at"))
-        last_record = self._safe_datetime(summary.get("last_record_at"))
-        input_pct = (input_tokens / total * 100) if total else 0
-        output_pct = (output_tokens / total * 100) if total else 0
-        cached_pct_of_input = (input_cached / input_tokens * 100) if input_tokens else 0
-        input_other_pct = (input_other / total * 100) if total else 0
-        input_cached_pct = (input_cached / total * 100) if total else 0
+
+        first_dt = self._parse_datetime(summary.get("first_record_at"))
+        last_dt = self._parse_datetime(summary.get("last_record_at"))
+        active_days = max((last_dt - first_dt).days, 1) if (first_dt and last_dt) else None
+
+        return {
+            "calls": calls,
+            "total": total,
+            "input_tokens": input_tokens,
+            "input_other": input_other,
+            "input_cached": input_cached,
+            "output_tokens": output_tokens,
+            "provider_count": provider_count,
+            "avg_total": (total / calls) if calls else 0,
+            "first_record": self._safe_datetime(summary.get("first_record_at")),
+            "last_record": self._safe_datetime(summary.get("last_record_at")),
+            "input_pct": (input_tokens / total * 100) if total else 0,
+            "output_pct": (output_tokens / total * 100) if total else 0,
+            "input_other_pct": (input_other / total * 100) if total else 0,
+            "input_cached_pct": (input_cached / total * 100) if total else 0,
+            "cached_pct_of_input": (input_cached / input_tokens * 100) if input_tokens else 0,
+            "active_days": active_days,
+            "avg_tokens_per_day": (total / active_days) if active_days else None,
+            "avg_calls_per_day": (calls / active_days) if active_days else None,
+        }
+
+    def _format_unified_report(
+        self,
+        summary: dict[str, Any],
+        rows: list[dict[str, Any]],
+    ) -> str:
+        m = self._compute_summary_metrics(summary)
+        calls = m["calls"]
+        total = m["total"]
+        input_tokens = m["input_tokens"]
+        input_other = m["input_other"]
+        input_cached = m["input_cached"]
+        output_tokens = m["output_tokens"]
+        provider_count = m["provider_count"]
+        avg_total = m["avg_total"]
+        first_record = m["first_record"]
+        last_record = m["last_record"]
+        input_pct = m["input_pct"]
+        output_pct = m["output_pct"]
+        cached_pct_of_input = m["cached_pct_of_input"]
+        input_other_pct = m["input_other_pct"]
+        input_cached_pct = m["input_cached_pct"]
 
         if calls == 0:
             return (
@@ -257,20 +331,19 @@ class LifetimeTokenStatsPlugin(Star):
         summary: dict[str, Any],
         rows: list[dict[str, Any]],
     ) -> str:
-        calls = int(summary.get("lifetime_calls") or 0)
-        total = int(summary.get("total_tokens") or 0)
-        input_tokens = int(summary.get("input_tokens") or 0)
-        input_other = int(summary.get("input_other_tokens") or 0)
-        input_cached = int(summary.get("input_cached_tokens") or 0)
-        output_tokens = int(summary.get("output_tokens") or 0)
-        provider_count = int(summary.get("provider_count") or 0)
-        avg_total = total / calls if calls else 0
-        first_record = self._safe_datetime(summary.get("first_record_at"))
-        last_record = self._safe_datetime(summary.get("last_record_at"))
-        first_dt = self._parse_datetime(summary.get("first_record_at"))
-        last_dt = self._parse_datetime(summary.get("last_record_at"))
-        active_days = max((last_dt - first_dt).days, 1) if (first_dt and last_dt) else None
-        avg_tokens_per_day = (total / active_days) if active_days else None
+        m = self._compute_summary_metrics(summary)
+        calls = m["calls"]
+        total = m["total"]
+        input_other = m["input_other"]
+        input_cached = m["input_cached"]
+        output_tokens = m["output_tokens"]
+        provider_count = m["provider_count"]
+        avg_total = m["avg_total"]
+        first_record = m["first_record"]
+        last_record = m["last_record"]
+        active_days = m["active_days"]
+        avg_tokens_per_day = m["avg_tokens_per_day"]
+        avg_calls_per_day = m["avg_calls_per_day"]
 
         if calls == 0:
             body = """
@@ -286,10 +359,11 @@ class LifetimeTokenStatsPlugin(Star):
                 generated_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
             )
 
-        output_pct = (output_tokens / total * 100) if total else 0
-        input_other_pct = (input_other / total * 100) if total else 0
-        input_cached_pct = (input_cached / total * 100) if total else 0
-        cached_pct_of_input = (input_cached / input_tokens * 100) if input_tokens else 0
+        input_pct = m["input_pct"]
+        output_pct = m["output_pct"]
+        input_other_pct = m["input_other_pct"]
+        input_cached_pct = m["input_cached_pct"]
+        cached_pct_of_input = m["cached_pct_of_input"]
 
         token_pie_bg = (
             f"conic-gradient("
@@ -323,9 +397,6 @@ class LifetimeTokenStatsPlugin(Star):
                 """
             )
 
-        shown_tokens = sum(int(row.get("total_tokens") or 0) for row in rows)
-        others_tokens = max(total - shown_tokens, 0)
-
         # Color is assigned by each provider's identity (provider_id +
         # provider_model, sorted alphabetically) rather than by its current
         # rank/position in `rows` (which is sorted by total_tokens and can
@@ -345,47 +416,17 @@ class LifetimeTokenStatsPlugin(Star):
             key = (str(row.get("provider_id") or "<unknown>"), str(row.get("provider_model") or "<unknown>"))
             return self._provider_color(color_index[key])
 
-        provider_segments = []
-        for row in rows:
-            provider_total = int(row.get("total_tokens") or 0)
-            pct = (provider_total / total * 100) if total else 0.0
-            color = _color_for_row(row)
-            name, model = self._provider_display_name(row.get("provider_id"), row.get("provider_model"))
-            label = f"{name} / {model}" if model else name
-            provider_segments.append((label, provider_total, pct, color))
-        if others_tokens > 0:
-            provider_segments.append(
-                (
-                    "Others",
-                    others_tokens,
-                    (others_tokens / total * 100) if total else 0.0,
-                    self.OTHERS_COLOR,
-                )
-            )
-
-        provider_pie_parts = []
-        provider_legend_items = []
-        cumulative = 0.0
-        for label, value, pct, color in provider_segments:
-            next_cumulative = cumulative + pct
-            provider_pie_parts.append(f"{color} {cumulative:.4f}% {next_cumulative:.4f}%")
-            cumulative = next_cumulative
-            provider_legend_items.append(
-                f"""
-                <div class="pie-legend-item small">
-                  <i class="pie-dot" style="background:{color};"></i>
-                  <span>{escape(label)}</span>
-                  <b>{pct:.2f}%</b>
-                </div>
-                """
-            )
-        provider_pie_bg = f"conic-gradient({', '.join(provider_pie_parts)})" if provider_pie_parts else "#e2e8f0"
-
         max_tokens = max((int(row.get("total_tokens") or 0) for row in rows), default=0)
         provider_cards = []
         for index, row in enumerate(rows, start=1):
-            provider_id = escape(str(row.get("provider_id") or "<unknown>"))
-            provider_model = escape(str(row.get("provider_model") or "<unknown>"))
+            # 修復 / Fix: 之前這裡直接用原始 provider_id / provider_model，
+            # 沒有像文字報表跟 legend 一樣呼叫 _provider_display_name 去重，
+            # 導致 provider_id 尾端已包含 model 名稱時（例如
+            # "google_gemini/gemini-3.1-flash-lite" + "gemini-3.1-flash-lite"）
+            # 卡片上會把同一個 model 名稱重複顯示兩次。
+            name, model = self._provider_display_name(row.get("provider_id"), row.get("provider_model"))
+            provider_id = escape(name)
+            provider_model = escape(model)
             provider_calls = int(row.get("calls") or 0)
             provider_total = int(row.get("total_tokens") or 0)
             provider_input = int(row.get("input_tokens") or 0)
@@ -396,6 +437,9 @@ class LifetimeTokenStatsPlugin(Star):
             provider_last = escape(self._safe_datetime(row.get("last_record_at")))
             color = _color_for_row(row)
             rank_text_color = self._readable_text_color(color)
+            # model 為空字串代表 provider_id 已經包含 model 名稱，此時整行省略，
+            # 不留下一個空的 .provider-model div。
+            model_line = f'<div class="provider-model">{provider_model}</div>' if provider_model else ""
 
             provider_cards.append(
                 f"""
@@ -407,7 +451,7 @@ class LifetimeTokenStatsPlugin(Star):
                     </div>
                     <div class="provider-total">{self._fmt(provider_total)}</div>
                   </div>
-                  <div class="provider-model">{provider_model}</div>
+                  {model_line}
                   <div class="bar"><div class="bar-fill" style="width: {width:.2f}%; background: {color};"></div></div>
                   <div class="provider-meta">
                     <span>Calls {self._fmt(provider_calls)}</span>
@@ -423,6 +467,8 @@ class LifetimeTokenStatsPlugin(Star):
                 """
             )
 
+        providers_caption = f"Top {self.provider_limit} shown" if provider_count > len(rows) else ""
+
         body = f"""
           <div class="grid">
             <div class="metric hero">
@@ -434,12 +480,13 @@ class LifetimeTokenStatsPlugin(Star):
               <div class="value">{self._fmt(calls)}</div>
             </div>
             <div class="metric">
-              <div class="label">INPUT TOKENS</div>
-              <div class="value">{self._fmt(input_tokens)}</div>
+              <div class="label">CACHE HIT RATE</div>
+              <div class="value">{cached_pct_of_input:.2f}%</div>
             </div>
             <div class="metric">
-              <div class="label">OUTPUT TOKENS</div>
-              <div class="value">{self._fmt(output_tokens)}</div>
+              <div class="label">PROVIDERS</div>
+              <div class="value">{self._fmt(provider_count)}</div>
+              {f'<div class="caption">{escape(providers_caption)}</div>' if providers_caption else ''}
             </div>
           </div>
 
@@ -453,6 +500,14 @@ class LifetimeTokenStatsPlugin(Star):
                 </div>
               </div>
               <div class="pie-side">
+                <div class="stack">
+                  <div class="stack-input" style="width: {input_pct:.2f}%"></div>
+                  <div class="stack-output" style="width: {output_pct:.2f}%"></div>
+                </div>
+                <div class="legend">
+                  <span><i class="dot input"></i>Input {input_pct:.2f}%</span>
+                  <span><i class="dot output"></i>Output {output_pct:.2f}%</span>
+                </div>
                 <div class="breakdown-list">
                   {''.join(token_rows_html)}
                 </div>
@@ -461,8 +516,8 @@ class LifetimeTokenStatsPlugin(Star):
           </div>
 
           <div class="details">
-            <div><span>Providers</span><b>{self._fmt(provider_count)} · Top {self.provider_limit} shown</b></div>
             <div><span>Avg Tokens / Call</span><b>{avg_total:,.2f}</b></div>
+            <div><span>Avg Calls / Day</span><b>{f"{avg_calls_per_day:,.1f}" if avg_calls_per_day is not None else "N/A"}</b></div>
             <div><span>Active Period</span><b>{f"{active_days:,} days" if active_days is not None else "N/A"}</b></div>
             <div><span>Avg Tokens / Day</span><b>{f"{avg_tokens_per_day:,.0f}" if avg_tokens_per_day is not None else "N/A"}</b></div>
           </div>
@@ -472,17 +527,6 @@ class LifetimeTokenStatsPlugin(Star):
               <div>
                 <div class="section-title">Provider Lifetime Ranking</div>
                 <div class="section-subtitle">Shown: {len(rows)} / {provider_count}</div>
-              </div>
-            </div>
-            <div class="provider-pie-strip">
-              <div class="provider-pie-chart" style="background: {provider_pie_bg};">
-                <div class="provider-pie-hole">
-                  <div class="pie-total-label">Total</div>
-                  <div class="pie-total-value">{self._fmt(total)}</div>
-                </div>
-              </div>
-              <div class="pie-legend compact">
-                {''.join(provider_legend_items)}
               </div>
             </div>
             <div class="providers">
@@ -531,6 +575,7 @@ class LifetimeTokenStatsPlugin(Star):
   .metric .label {{ font-size: 13px; color: #64748b; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }}
   .metric .value {{ margin-top: 8px; font-size: 24px; font-weight: 800; letter-spacing: -0.035em; }}
   .metric.hero .value {{ color: #1d4ed8; font-size: 27px; }}
+  .metric .caption {{ margin-top: 4px; font-size: 12px; color: #94a3b8; font-weight: 700; }}
   .section {{ margin-top: 14px; padding: 16px; border-radius: 18px; background: #f8fafc; border: 1px solid #e2e8f0; }}
   .section-title {{ font-size: 17px; font-weight: 800; margin-bottom: 10px; }}
   .section-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 14px; }}
@@ -541,23 +586,19 @@ class LifetimeTokenStatsPlugin(Star):
   .pie-total-label {{ color: #64748b; font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }}
   .pie-total-value {{ margin-top: 6px; font-size: 22px; font-weight: 900; letter-spacing: -0.04em; }}
   .pie-side {{ display: grid; gap: 10px; }}
-  .pie-legend {{ display: grid; gap: 8px; }}
-  .pie-legend.compact {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; flex: 1; min-width: 220px; }}
-  .pie-legend-item {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; font-size: 13px; }}
-  .pie-legend-item.small {{ font-size: 12px; padding: 6px 10px; }}
-  .pie-legend-item span {{ flex: 1; color: #334155; font-weight: 700; overflow-wrap: anywhere; }}
-  .pie-legend-item b {{ white-space: nowrap; }}
   .pie-dot {{ width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }}
+  .stack {{ display: flex; overflow: hidden; height: 24px; border-radius: 999px; background: #e2e8f0; }}
+  .stack-input {{ background: linear-gradient(90deg, #2563eb, #60a5fa); }}
+  .stack-output {{ background: linear-gradient(90deg, #10b981, #34d399); }}
+  .legend {{ display: flex; gap: 14px; margin-top: 2px; font-size: 13px; color: #475569; font-weight: 700; flex-wrap: wrap; }}
+  .dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 7px; }}
+  .dot.input {{ background: #2563eb; }}
+  .dot.output {{ background: #10b981; }}
   .details {{ margin-top: 14px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }}
   .details div {{ display: flex; justify-content: space-between; gap: 12px; padding: 12px 14px; border-radius: 12px; background: #f8fafc; border: 1px solid #e2e8f0; font-size: 14px; }}
   .details span {{ color: #64748b; font-weight: 700; }}
   .details b {{ text-align: right; overflow-wrap: anywhere; }}
   .providers {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }}
-  .provider-pie-strip {{ display: flex; align-items: center; gap: 16px; margin-bottom: 12px; padding: 14px; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; flex-wrap: wrap; }}
-  .provider-pie-chart {{ width: 130px; height: 130px; border-radius: 50%; position: relative; flex-shrink: 0; }}
-  .provider-pie-hole {{ position: absolute; inset: 16px; background: #ffffff; border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; box-shadow: inset 0 0 0 1px #e2e8f0; }}
-  .provider-pie-hole .pie-total-label {{ font-size: 11px; }}
-  .provider-pie-hole .pie-total-value {{ margin-top: 3px; font-size: 15px; }}
   .provider-row {{ border: 1px solid #e2e8f0; border-radius: 16px; padding: 14px; background: #fbfdff; }}
   .provider-head {{ display: flex; align-items: center; justify-content: space-between; gap: 18px; }}
   .provider-name {{ display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 16px; font-weight: 800; overflow-wrap: anywhere; }}

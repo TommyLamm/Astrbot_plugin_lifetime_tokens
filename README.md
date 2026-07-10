@@ -159,3 +159,52 @@ Then reload plugins in AstrBot WebUI.
     shown" caption underneath only when the count is actually truncated.
 - Details grid: since "Providers" moved up to the hero row, added
   "Avg Calls / Day" in its place to keep the 2x2 grid balanced.
+
+## v0.6.5 — Backend performance & de-duplication
+
+Backend-focused changes; no visible UI changes.
+
+- **Merged two full-table scans into one.** Previously each command ran a
+  dedicated `COUNT`/`SUM` summary query *and* a separate `GROUP BY` +
+  `LIMIT` provider query, both scanning the entire `provider_stats` table,
+  sequentially. Now there is a single `GROUP BY` query (no `LIMIT`) that
+  returns every provider group; the lifetime summary is derived in Python
+  by summing/min/max-ing over that same result set, and the displayed
+  rows are simply the first `provider_limit` entries of it. One query
+  instead of two, and `provider_count` no longer needs its own
+  `COUNT(DISTINCT ...)` expression.
+- **Removed duplicate summary-metric calculations.** `_format_unified_report`
+  (text) and `_build_unified_report_html` (image) used to each recompute
+  the same set of derived numbers (percentages, averages, active-day
+  span) from scratch. Both now call a single `_compute_summary_metrics()`
+  helper, so the formulas only exist in one place — the same class of bug
+  fixed for display in v0.6.3, now fixed for the underlying calculations.
+- **Error messages no longer leak exception details to chat.** On failure,
+  users now see a generic message pointing at the log; the exception
+  type/message is still fully logged via `logger.exception(...)` for
+  debugging, just not echoed back into the chat.
+- **Fixed: provider cards in the image report skipped the id/model
+  de-dup helper.** `_provider_display_name()` (already used by the text
+  report and the ranking pie legend) strips the model name when
+  `provider_id` already ends with it — e.g. `provider_id=
+  "google_gemini/gemini-3.1-flash-lite"` with `provider_model=
+  "gemini-3.1-flash-lite"`. The per-provider cards below the pie were
+  built from the raw `provider_id`/`provider_model` fields directly and
+  skipped this check, so that model name rendered twice on the card
+  even though the legend right above it already showed it de-duplicated.
+  Cards now call the same helper and omit the model line entirely when
+  there's nothing left to show after de-duping.
+
+## v0.6.6
+
+- Removed the "Provider Ranking" pie chart + compact legend strip that
+  sat above the per-provider card list. It showed the same three things
+  (color, name, share %) that each card below it already shows via its
+  rank-badge color, name, and `Share` line — a duplicate-info pattern in
+  the same spirit as the ones fixed in earlier versions, just not caught
+  until now. The section now goes straight from the "Provider Lifetime
+  Ranking" header into the card grid. Removed the now-dead
+  `provider_segments`/`provider_pie_bg`/`provider_legend_items`
+  computation and the corresponding `.provider-pie-*` / `.pie-legend*`
+  CSS, along with the now-unused `OTHERS_COLOR` constant (its only
+  consumer, the pie's "Others" slice, no longer exists).
