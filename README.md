@@ -2,6 +2,10 @@
 
 A small AstrBot plugin that reads the existing `provider_stats` table and reports lifetime token usage.
 
+The image report also includes a Plugin API Calls ledger for records tagged by
+`astrbot-model-usage >= 0.2.0`. Older rows without a reliable source tag remain
+visible as `Legacy / Unattributed`.
+
 This version uses a unified design with only two commands.
 
 ## Preview

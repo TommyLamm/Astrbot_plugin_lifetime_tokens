@@ -28,6 +28,14 @@ class LifetimeTokenStatsPlugin(Star):
     MAX_PROVIDER_LIMIT = 50
     VIEWPORT_WIDTH = 1200
     VIEWPORT_HEIGHT = 680
+    PLUGIN_SOURCE_PREFIX = "plugin:"
+    LEGACY_SOURCE = "legacy_unattributed"
+    PLUGIN_SOURCE_LABELS = {
+        "heartflow": "Heartflow",
+        "gemini_search": "Gemini Search",
+        "livingmemory": "LivingMemory",
+        "daily_analysis": "Daily Analysis",
+    }
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context, config)
@@ -44,7 +52,7 @@ class LifetimeTokenStatsPlugin(Star):
     async def lifetime_report(self, event: AstrMessageEvent):
         """Show a unified lifetime token report in text."""
         try:
-            summary, rows = await self._fetch_report_data()
+            summary, rows, _plugin_rows = await self._fetch_report_data()
             yield event.plain_result(self._format_unified_report(summary, rows))
         except Exception as exc:
             logger.exception("Failed to query unified lifetime token report.")
@@ -57,8 +65,8 @@ class LifetimeTokenStatsPlugin(Star):
     async def lifetime_report_img(self, event: AstrMessageEvent):
         """Render a unified lifetime token report as a T2I image."""
         try:
-            summary, rows = await self._fetch_report_data()
-            html = self._build_unified_report_html(summary, rows)
+            summary, rows, plugin_rows = await self._fetch_report_data()
+            html = self._build_unified_report_html(summary, rows, plugin_rows)
             fallback_text = self._format_unified_report(summary, rows)
             image = await self._render_stats_image(html, fallback_text)
             yield event.image_result(image)
@@ -72,8 +80,10 @@ class LifetimeTokenStatsPlugin(Star):
     async def terminate(self) -> None:
         logger.info("Lifetime Token Stats plugin unloaded.")
 
-    async def _fetch_report_data(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        """Fetch everything both report renderers need with a single query.
+    async def _fetch_report_data(
+        self,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Fetch provider totals and plugin-source breakdown rows.
 
         優化重點 / Optimization: 舊版分別呼叫 `_query_lifetime_summary`（全表
         COUNT/SUM）與 `_query_provider_lifetime`（全表 GROUP BY + LIMIT），
@@ -82,14 +92,15 @@ class LifetimeTokenStatsPlugin(Star):
         LIMIT 的 GROUP BY 查詢撈出「所有」provider 分組，lifetime summary
         再用 Python 對這份結果做 sum/min/max 彙總即可，不需要第二次掃表。
 
-        Returns (summary, rows) where `rows` is already truncated to
+        Returns (summary, rows, plugin_rows) where `rows` is already truncated to
         `self.provider_limit` for display, while `summary` reflects the
         totals across *all* providers (not just the shown ones).
         """
         all_rows = await self._query_all_provider_stats()
+        plugin_rows = await self._query_plugin_source_stats()
         summary = self._summarize_provider_rows(all_rows)
         rows = all_rows[: self.provider_limit]
-        return summary, rows
+        return summary, rows, plugin_rows
 
     async def _query_all_provider_stats(self) -> list[dict[str, Any]]:
         """Group by provider identity across the whole table, no LIMIT.
@@ -125,6 +136,49 @@ class LifetimeTokenStatsPlugin(Star):
 
         async with db.get_db() as session:
             result = await session.execute(sql, {"agent_type": self.AGENT_TYPE})
+            rows = result.mappings().all()
+
+        return [dict(row) for row in rows]
+
+    async def _query_plugin_source_stats(self) -> list[dict[str, Any]]:
+        """Group source-tagged and historical untagged provider stats."""
+        db = getattr(self.context, "_db", None)
+        if db is None or not hasattr(db, "get_db"):
+            raise RuntimeError("Cannot access AstrBot database from plugin context.")
+
+        sql = text(
+            """
+            SELECT
+                CASE
+                    WHEN conversation_id LIKE :plugin_pattern
+                        THEN SUBSTR(conversation_id, :source_start)
+                    ELSE :legacy_source
+                END AS source,
+                COUNT(*) AS calls,
+                COALESCE(SUM(token_input_other), 0) AS input_other_tokens,
+                COALESCE(SUM(token_input_cached), 0) AS input_cached_tokens,
+                COALESCE(SUM(token_input_other + token_input_cached), 0) AS input_tokens,
+                COALESCE(SUM(token_output), 0) AS output_tokens,
+                COALESCE(SUM(token_input_other + token_input_cached + token_output), 0)
+                    AS total_tokens,
+                MIN(created_at) AS first_record_at,
+                MAX(created_at) AS last_record_at
+            FROM provider_stats
+            WHERE agent_type = :agent_type
+              AND (conversation_id LIKE :plugin_pattern OR conversation_id IS NULL)
+            GROUP BY source
+            ORDER BY total_tokens DESC
+            """
+        )
+        params = {
+            "agent_type": self.AGENT_TYPE,
+            "plugin_pattern": f"{self.PLUGIN_SOURCE_PREFIX}%",
+            "source_start": len(self.PLUGIN_SOURCE_PREFIX) + 1,
+            "legacy_source": self.LEGACY_SOURCE,
+        }
+
+        async with db.get_db() as session:
+            result = await session.execute(sql, params)
             rows = result.mappings().all()
 
         return [dict(row) for row in rows]
@@ -330,6 +384,7 @@ class LifetimeTokenStatsPlugin(Star):
         self,
         summary: dict[str, Any],
         rows: list[dict[str, Any]],
+        plugin_rows: list[dict[str, Any]] | None = None,
     ) -> str:
         m = self._compute_summary_metrics(summary)
         calls = m["calls"]
@@ -395,6 +450,68 @@ class LifetimeTokenStatsPlugin(Star):
                   </div>
                 </div>
                 """
+            )
+
+        plugin_rows = plugin_rows or []
+        max_plugin_tokens = max(
+            (int(row.get("total_tokens") or 0) for row in plugin_rows),
+            default=0,
+        )
+        plugin_cards = []
+        for index, row in enumerate(plugin_rows):
+            source = str(row.get("source") or self.LEGACY_SOURCE)
+            is_legacy = source == self.LEGACY_SOURCE
+            source_label = self._plugin_source_display_name(source)
+            source_code = "No source tag" if is_legacy else f"plugin:{source}"
+            source_calls = int(row.get("calls") or 0)
+            source_input = int(row.get("input_tokens") or 0)
+            source_cached = int(row.get("input_cached_tokens") or 0)
+            source_output = int(row.get("output_tokens") or 0)
+            source_total = int(row.get("total_tokens") or 0)
+            source_share = (source_total / total * 100) if total else 0
+            source_width = (
+                source_total / max_plugin_tokens * 100 if max_plugin_tokens else 0
+            )
+            source_first = escape(self._safe_datetime(row.get("first_record_at")))
+            source_last = escape(self._safe_datetime(row.get("last_record_at")))
+            color = "#d97706" if is_legacy else self._provider_color(index + 2)
+            legacy_class = " legacy" if is_legacy else ""
+            legacy_note = (
+                '<div class="plugin-note">Includes earlier rows without a reliable source tag.</div>'
+                if is_legacy
+                else ""
+            )
+            plugin_cards.append(
+                f"""
+                <div class="plugin-card{legacy_class}" style="--source-color:{color};">
+                  <div class="plugin-card-head">
+                    <div>
+                      <div class="plugin-eyebrow">API SOURCE</div>
+                      <div class="plugin-name">{escape(source_label)}</div>
+                    </div>
+                    <div class="plugin-total">{self._fmt(source_total)}</div>
+                  </div>
+                  <div class="plugin-source">{escape(source_code)}</div>
+                  {legacy_note}
+                  <div class="plugin-bar"><div style="width:{source_width:.2f}%"></div></div>
+                  <div class="plugin-metrics">
+                    <span>Calls <b>{self._fmt(source_calls)}</b></span>
+                    <span>Input <b>{self._fmt(source_input)}</b></span>
+                    <span>Cached <b>{self._fmt(source_cached)}</b></span>
+                    <span>Output <b>{self._fmt(source_output)}</b></span>
+                    <span>Share <b>{source_share:.2f}%</b></span>
+                  </div>
+                  <div class="plugin-dates">{source_first} → {source_last}</div>
+                </div>
+                """
+            )
+
+        if plugin_cards:
+            plugin_section_body = f'<div class="plugin-ledger">{"".join(plugin_cards)}</div>'
+        else:
+            plugin_section_body = (
+                '<div class="plugin-empty">No source-tagged plugin calls yet. '
+                "New calls will appear after plugins using recorder v0.2.0 are active.</div>"
             )
 
         # Color is assigned by each provider's identity (provider_id +
@@ -522,6 +639,16 @@ class LifetimeTokenStatsPlugin(Star):
             <div><span>Avg Tokens / Day</span><b>{f"{avg_tokens_per_day:,.0f}" if avg_tokens_per_day is not None else "N/A"}</b></div>
           </div>
 
+          <div class="section plugin-section">
+            <div class="section-head">
+              <div>
+                <div class="section-title">Plugin API Calls</div>
+                <div class="section-subtitle">Source-tagged model calls · Legacy keeps earlier untagged rows visible</div>
+              </div>
+            </div>
+            {plugin_section_body}
+          </div>
+
           <div class="section">
             <div class="section-head">
               <div>
@@ -609,6 +736,22 @@ class LifetimeTokenStatsPlugin(Star):
   .bar-fill {{ height: 100%; border-radius: 999px; }}
   .provider-meta {{ margin-top: 8px; display: flex; gap: 10px; flex-wrap: wrap; color: #475569; font-size: 12px; font-weight: 700; }}
   .provider-dates {{ margin-top: 8px; display: flex; gap: 12px; flex-wrap: wrap; color: #64748b; font-size: 11px; font-weight: 700; }}
+  .plugin-section {{ background: linear-gradient(180deg, #f8fafc, #f1f5f9); }}
+  .plugin-ledger {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }}
+  .plugin-card {{ position: relative; overflow: hidden; padding: 15px; border-radius: 16px; background: #ffffff; border: 1px solid #dbe4ee; box-shadow: inset 4px 0 0 var(--source-color); }}
+  .plugin-card.legacy {{ background: #fffbeb; border-color: #fde68a; }}
+  .plugin-card-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }}
+  .plugin-eyebrow {{ color: var(--source-color); font-size: 10px; line-height: 1; font-weight: 900; letter-spacing: 0.14em; }}
+  .plugin-name {{ margin-top: 5px; font-size: 17px; font-weight: 900; letter-spacing: -0.02em; overflow-wrap: anywhere; }}
+  .plugin-total {{ font-size: 20px; line-height: 1; font-weight: 900; white-space: nowrap; }}
+  .plugin-source {{ display: inline-flex; margin-top: 8px; padding: 4px 8px; border-radius: 7px; background: #eef2f7; color: #475569; font: 700 11px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }}
+  .plugin-note {{ margin-top: 7px; color: #92400e; font-size: 11px; font-weight: 700; }}
+  .plugin-bar {{ height: 8px; margin-top: 11px; overflow: hidden; border-radius: 999px; background: #e2e8f0; }}
+  .plugin-bar div {{ height: 100%; min-width: 3px; border-radius: inherit; background: var(--source-color); }}
+  .plugin-metrics {{ margin-top: 9px; display: flex; flex-wrap: wrap; gap: 6px 13px; color: #64748b; font-size: 11px; font-weight: 700; }}
+  .plugin-metrics b {{ margin-left: 3px; color: #1e293b; }}
+  .plugin-dates {{ margin-top: 8px; color: #94a3b8; font-size: 10px; font-weight: 700; }}
+  .plugin-empty {{ padding: 20px; border-radius: 14px; border: 1px dashed #cbd5e1; background: #ffffff; color: #64748b; font-size: 13px; font-weight: 700; text-align: center; }}
   .breakdown-list {{ display: grid; grid-template-columns: 1fr; gap: 8px; }}
   .breakdown-row {{ padding: 10px 12px; border-radius: 14px; background: #ffffff; border: 1px solid #e2e8f0; }}
   .breakdown-head {{ display: flex; justify-content: space-between; gap: 10px; align-items: center; font-size: 14px; font-weight: 800; margin-bottom: 8px; }}
@@ -668,6 +811,15 @@ class LifetimeTokenStatsPlugin(Star):
         if pmodel != "<unknown>" and pid != "<unknown>" and pid.endswith(pmodel):
             return pid, ""
         return pid, pmodel
+
+    @classmethod
+    def _plugin_source_display_name(cls, source: str) -> str:
+        if source == cls.LEGACY_SOURCE:
+            return "Legacy / Unattributed"
+        return cls.PLUGIN_SOURCE_LABELS.get(
+            source,
+            source.replace("_", " ").replace("-", " ").title(),
+        )
 
     @staticmethod
     def _provider_color(index: int) -> str:
